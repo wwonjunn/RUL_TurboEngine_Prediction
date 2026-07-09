@@ -9,7 +9,7 @@ from scoring import score
 
 project_dir = Path(__file__).parent.parent
 
-train_file_name = "train_FD001.txt"
+train_file_name = "train_FD004.txt"
 train = data_load(train_file_name)
 train = compute_rul(train)
 

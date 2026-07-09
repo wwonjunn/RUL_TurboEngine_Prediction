@@ -1,9 +1,10 @@
 import pandas as pd
-from pathlib import Path
 import numpy as np
+from pathlib import Path
+
+project_dir = Path(__file__).parent.parent
 
 def data_load(file_name):
-    project_dir = Path(__file__).parent.parent
     # Column 1: Engine unit number (unique identifier)
     # Column 2: Time cycle (operational cycle number)
     # Columns 3-5: Operational settings (flight altitude, throttle resolver angle, etc.)
@@ -11,51 +12,53 @@ def data_load(file_name):
     cols = ["Engine Number", "Cycle"] + \
            [f'Operation Setting {i}' for i in range(1, 4)] + \
            [f'Sensor Measurement {i}' for i in range(1, 22)]
-    df = pd.read_csv(project_dir / "CMAPSSData" / file_name, sep=r'\s+', header=None, names=cols)
+    df = pd.read_csv(project_dir / "CMAPSSData" / file_name,
+                     sep=r'\s+', header=None, names=cols)
     return df
 
-def compute_rul(train):
-    max_cycle = train.groupby("Engine Number")["Cycle"].transform("max")
-    train["RUL"] = max_cycle - train["Cycle"]
-    return train
+def compute_rul(df):
+    max_cycle = df.groupby("Engine Number")["Cycle"].transform("max")
+    df["RUL"] = max_cycle - df["Cycle"]
+    return df
 
-def get_dead_sensors(train, threshold=0.01):
+def get_dead_sensors(df, threshold=0.01):
     # by std() this drops any sensors that basically don't fluctuate at all
     sensor_cols = [f'Sensor Measurement {i}' for i in range(1, 22)]
-    std = train[sensor_cols].std()
+    std = df[sensor_cols].std()
     return std[std < threshold].index.tolist()
 
+def get_feature_cols(df):
+    # includes operation settings so model can condition on flight state
+    # critical for FD002/FD004 which have 6 operating conditions
+    return [c for c in df.columns if 'Sensor' in c or 'Operation' in c]
 
-# Jun - for DA transformer - making windows for training
-# upon literature searching ~windows of 30 is pretty standard so lets use 30 for now
-
-def make_windows(df, sensor_cols, window_size=30):
+def make_windows(df, feature_cols, window_size=30):
     X, y = [], []
     for engine_id, group in df.groupby("Engine Number"):
         group = group.sort_values("Cycle")
-        sensors = group[sensor_cols].values  # shape [num_cycles x 14]
+        features = group[feature_cols].values
         ruls = group["RUL"].values
 
         if len(group) < window_size:
-            continue  # engine too short, skip entirely
+            continue
 
         for i in range(len(group) - window_size + 1):
-            X.append(sensors[i:i + window_size])       # 30 rows of sensors
-            y.append(ruls[i + window_size - 1])        # RUL at last cycle of window
+            X.append(features[i:i + window_size])
+            y.append(ruls[i + window_size - 1])
 
-    return np.array(X), np.array(y)  # shapes: [N x 30 x 14], [N]
+    return np.array(X), np.array(y)
 
-def make_test_windows(df, sensor_cols, window_size=30):
+def make_test_windows(df, feature_cols, window_size=30):
     X = []
     for engine_id, group in df.groupby("Engine Number"):
         group = group.sort_values("Cycle")
-        sensors = group[sensor_cols].values
+        features = group[feature_cols].values
 
-        if len(sensors) < window_size:
+        if len(features) < window_size:
             # pad short engines by repeating first row
-            pad = np.repeat(sensors[0:1], window_size - len(sensors), axis=0)
-            sensors = np.vstack([pad, sensors])
+            pad = np.repeat(features[0:1], window_size - len(features), axis=0)
+            features = np.vstack([pad, features])
 
-        X.append(sensors[-window_size:])  # always take the last 30 cycles
+        X.append(features[-window_size:])
 
-    return np.array(X)  # shape: [num_test_engines x 30 x 14]
+    return np.array(X)
