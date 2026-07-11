@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+cnn_bilstm_results.csv
+cnn_run_log.txt
+*.log

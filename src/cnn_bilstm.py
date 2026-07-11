@@ -1,20 +1,27 @@
 """
 CNN-BiLSTM model for Remaining Useful Life (RUL) prediction on NASA CMAPSS.
 
-This is one of the three SOTA methods in the project. It mirrors the structure
-of baseline.py and reuses data_loader.py (for loading / RUL / dead-sensor logic)
-and scoring.py (for the RMSE + NASA score).
+One of the three SOTA methods in the project. Uses the SHARED pipeline in
+data_loader.py (loading / RUL / dead sensors / windowing) and scoring.py
+(RMSE + NASA score), so the only thing that differs between this and the
+Transformer is the model in Stage 4.
 
 Pipeline:
     1. Load train + test, compute RUL on train, drop "dead" (constant) sensors.
-    2. Clip RUL with a piecewise-linear cap (standard trick for CMAPSS).
-    3. Min-Max scale sensors (fit on train, apply to test).
-    4. Build sliding windows of length WINDOW so the network sees a short
-       time-history instead of a single cycle.
-    5. Train a CNN -> BiLSTM -> Dense regressor.
-    6. Predict one RUL per test engine from its LAST window, then score.
+    2. Feature columns = 3 operation settings + surviving sensors.
+    3. Min-Max scale features (fit on train, apply to test).
+    4. Clip RUL with a piecewise-linear cap (standard trick for CMAPSS).
+    5. Sliding windows of length WINDOW so the net sees a short time-history.
+    6. Train CNN -> BiLSTM -> Dense regressor.
+    7. Predict one RUL per test engine from its LAST window, then score.
+
+Run:
+    python cnn_bilstm.py              # all four sub-datasets, prints a table
+    python cnn_bilstm.py FD001        # just one
+    python cnn_bilstm.py FD001 FD003  # a subset
 """
 
+import sys
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -24,58 +31,39 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import MinMaxScaler
 
-from data_loader import data_load, compute_rul, get_dead_sensors
+from data_loader import (data_load, compute_rul, get_dead_sensors,
+                         get_feature_cols, make_windows, make_test_windows)
 from scoring import score
 
 # ----------------------------- Config --------------------------------------
 project_dir = Path(__file__).parent.parent
 
-WINDOW     = 30      # number of cycles fed to the model at once
-MAX_RUL    = 125     # piecewise-linear RUL cap (engine is "healthy" above this)
+WINDOW     = 30      # cycles fed to the model at once
+MAX_RUL    = 125     # piecewise-linear RUL cap (matches DA_transformer.py)
 BATCH_SIZE = 256
-EPOCHS     = 20      # ~18-20 is the sweet spot on FD001 (longer can overfit)
+EPOCHS     = 20
 LR         = 1e-3
 SEED       = 42
 
-torch.manual_seed(SEED)
-np.random.seed(SEED)
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DATASETS = ["FD001", "FD002", "FD003", "FD004"]
+
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+else:
+    DEVICE = torch.device("cpu")
 
 
-# ------------------------- Windowing helpers --------------------------------
-def make_train_windows(df, sensor_cols, window=WINDOW):
-    """Slide a window over each engine. Label = clipped RUL at the window's
-    last cycle. Returns X (N, window, n_features) and y (N,)."""
-    X, y = [], []
-    for _, g in df.groupby("Engine Number"):
-        g = g.sort_values("Cycle")
-        feats = g[sensor_cols].values
-        ruls  = g["RUL"].values
-        # one window for every position where a full window fits
-        for i in range(len(g) - window + 1):
-            X.append(feats[i:i + window])
-            y.append(ruls[i + window - 1])      # RUL at the end of the window
-    return np.asarray(X, dtype=np.float32), np.asarray(y, dtype=np.float32)
-
-
-def make_test_windows(df, sensor_cols, window=WINDOW):
-    """Take the LAST window of each engine (that's where we must predict RUL).
-    Engines shorter than `window` are front-padded by repeating their first row."""
-    X = []
-    for _, g in df.groupby("Engine Number"):
-        g = g.sort_values("Cycle")
-        feats = g[sensor_cols].values
-        if len(feats) < window:
-            pad = np.repeat(feats[:1], window - len(feats), axis=0)
-            feats = np.vstack([pad, feats])
-        X.append(feats[-window:])               # most recent `window` cycles
-    return np.asarray(X, dtype=np.float32)
+def set_seed(seed=SEED):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
 
 class SeqDataset(Dataset):
     def __init__(self, X, y):
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
 
     def __len__(self):
         return len(self.X)
@@ -121,12 +109,12 @@ class CNN_BiLSTM(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, x):                 # x: (batch, window, features)
-        x = x.transpose(1, 2)             # -> (batch, features, window) for Conv1d
-        x = self.cnn(x)                   # -> (batch, cnn_ch, window)
-        x = x.transpose(1, 2)             # -> (batch, window, cnn_ch) for LSTM
-        out, _ = self.lstm(x)             # -> (batch, window, 2*hidden)
-        out = out[:, -1, :]               # last timestep's representation
+    def forward(self, x):                  # x: (batch, window, features)
+        x = x.transpose(1, 2)              # -> (batch, features, window) for Conv1d
+        x = self.cnn(x)                    # -> (batch, cnn_ch, window)
+        x = x.transpose(1, 2)              # -> (batch, window, cnn_ch) for LSTM
+        out, _ = self.lstm(x)              # -> (batch, window, 2*hidden)
+        out = out[:, -1, :]                # last timestep's representation
         return self.head(out).squeeze(-1)  # -> (batch,)
 
 
@@ -135,14 +123,14 @@ def train_model(model, loader, epochs=EPOCHS, lr=LR):
     model.to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+    rmse = float("nan")
     for epoch in range(1, epochs + 1):
         model.train()
         running = 0.0
         for xb, yb in loader:
             xb, yb = xb.to(DEVICE), yb.to(DEVICE)
             opt.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
+            loss = loss_fn(model(xb), yb)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)  # stabilize LSTM
             opt.step()
@@ -150,59 +138,96 @@ def train_model(model, loader, epochs=EPOCHS, lr=LR):
         rmse = (running / len(loader.dataset)) ** 0.5
         if epoch == 1 or epoch % 5 == 0 or epoch == epochs:
             print(f"  epoch {epoch:3d}/{epochs}  train RMSE {rmse:6.2f}")
-    return model
+    return model, rmse   # final train RMSE is reported in the paper
 
 
-# ------------------------------ Main ----------------------------------------
-def main(train_file_name="train_FD001.txt"):
-    # 1. Load + RUL + drop dead sensors (same logic as baseline.py)
-    train = data_load(train_file_name)
+# ------------------------------ One dataset ---------------------------------
+def run_one(fd_name="FD001"):
+    set_seed()
+    print(f"\n{'='*60}\nCNN-BiLSTM  |  {fd_name}\n{'='*60}")
+
+    # 1. Load + RUL + drop dead sensors (identical to baseline / DA_transformer)
+    train = data_load(f"train_{fd_name}.txt")
     train = compute_rul(train)
 
     dead_sensors = get_dead_sensors(train)
     train = train.drop(columns=dead_sensors)
 
-    test_file_name = train_file_name.replace("train", "test")
-    test = data_load(test_file_name)
-    test = test.drop(columns=dead_sensors)
+    test = data_load(f"test_{fd_name}.txt")
+    test = test.drop(columns=dead_sensors)      # same list derived from train
 
-    sensor_cols = [c for c in train.columns if "Sensor" in c]
+    # 2. Operation settings + surviving sensors
+    feature_cols = get_feature_cols(train)
 
-    # 2. Piecewise-linear RUL cap on the TRAIN labels
-    train["RUL"] = train["RUL"].clip(upper=MAX_RUL)
-
-    # 3. Min-Max scale sensors (fit on train, transform test)
+    # 3. Min-Max scale (fit on train, transform test)
     scaler = MinMaxScaler()
-    train[sensor_cols] = scaler.fit_transform(train[sensor_cols])
-    test[sensor_cols]  = scaler.transform(test[sensor_cols])
+    train[feature_cols] = scaler.fit_transform(train[feature_cols])
+    test[feature_cols] = scaler.transform(test[feature_cols])
 
-    # 4. Build windows
-    X_train, y_train = make_train_windows(train, sensor_cols, WINDOW)
-    X_test = make_test_windows(test, sensor_cols, WINDOW)
-    print(f"train windows: {X_train.shape}  test windows: {X_test.shape}  "
-          f"(features={len(sensor_cols)})")
+    # 4 + 5. Windows, then cap the TRAIN labels
+    X_train, y_train = make_windows(train, feature_cols, WINDOW)
+    X_test = make_test_windows(test, feature_cols, WINDOW)
+    y_train = np.minimum(y_train, MAX_RUL)
+
+    print(f"features={len(feature_cols)} "
+          f"(dead sensors dropped: {len(dead_sensors)})")
+    print(f"X_train: {X_train.shape}   X_test: {X_test.shape}")
 
     loader = DataLoader(SeqDataset(X_train, y_train),
                         batch_size=BATCH_SIZE, shuffle=True)
 
-    # 5. Train
-    model = CNN_BiLSTM(n_features=len(sensor_cols))
-    print(f"Training CNN-BiLSTM on {DEVICE} ...")
-    train_model(model, loader)
+    # 6. Train
+    print(f"Training on: {DEVICE}")
+    model = CNN_BiLSTM(n_features=len(feature_cols))
+    model, train_rmse = train_model(model, loader)
 
-    # 6. Predict last window per engine, clip to [0, MAX_RUL], and score
+    # 7. Predict last window per engine, clip to [0, MAX_RUL], score
     model.eval()
     with torch.no_grad():
-        y_pred = model(torch.from_numpy(X_test).to(DEVICE)).cpu().numpy()
+        X_tensor = torch.tensor(X_test, dtype=torch.float32).to(DEVICE)
+        y_pred = model(X_tensor).cpu().numpy()
     y_pred = np.clip(y_pred, 0, MAX_RUL)
 
-    RUL_file_name = train_file_name.replace("train", "RUL")
-    y_true = pd.read_csv(project_dir / "CMAPSSData" / RUL_file_name,
+    y_true = pd.read_csv(project_dir / "CMAPSSData" / f"RUL_{fd_name}.txt",
                          header=None, names=["RUL"])["RUL"].values
 
-    print("\n=== CNN-BiLSTM results ===")
-    score(y_pred, y_true)
+    assert len(y_pred) == len(y_true), \
+        f"{fd_name}: {len(y_pred)} predictions vs {len(y_true)} ground-truth RULs"
+
+    print(f"\nCNN-BiLSTM {fd_name}:")
+    rmse, nasa = score(y_pred, y_true)
+
+    # how many predictions overestimate RUL? these drive the NASA score
+    late = int(np.sum(y_pred - y_true > 0))
+    print(f"late predictions: {late}/{len(y_true)}")
+
+    return {"dataset": fd_name, "n_features": len(feature_cols),
+            "train_rmse": round(train_rmse, 2), "rmse": round(rmse, 2),
+            "nasa": round(nasa, 2), "late": late, "n_engines": len(y_true)}
+
+
+# ------------------------------ Main ----------------------------------------
+def main(datasets=DATASETS):
+    results = [run_one(fd) for fd in datasets]
+
+    print(f"\n{'='*76}")
+    print("CNN-BiLSTM SUMMARY  (paste this to Claude for the results table)")
+    print(f"{'='*76}")
+    print(f"{'Dataset':<10}{'Feats':>7}{'TrainRMSE':>12}{'TestRMSE':>11}"
+          f"{'NASA Score':>16}{'Late':>10}")
+    print("-" * 76)
+    for r in results:
+        print(f"{r['dataset']:<10}{r['n_features']:>7}{r['train_rmse']:>12.2f}"
+              f"{r['rmse']:>11.2f}{r['nasa']:>16.2f}"
+              f"{str(r['late']) + '/' + str(r['n_engines']):>10}")
+    print("=" * 76)
+
+    out = project_dir / "cnn_bilstm_results.csv"
+    pd.DataFrame(results).to_csv(out, index=False)
+    print(f"saved -> {out}")
+    return results
 
 
 if __name__ == "__main__":
-    main("train_FD001.txt")
+    args = sys.argv[1:]
+    main(args if args else DATASETS)
