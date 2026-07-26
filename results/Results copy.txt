@@ -1,0 +1,35 @@
+Baseline: 
+FD001:
+Linear Regression RMSE: 31.95
+NASA Score: 13223.39
+FD002:
+Linear Regression RMSE: 33.94
+NASA Score: 30521.64
+FD003:
+Linear Regression RMSE: 57.32
+NASA Score: 401472701.59
+FD004:
+Linear Regression RMSE: 47.63
+NASA Score: 436314.00
+------------------------------------------------------------------
+Domain Adaptive Transformer:
+
+Transformer (no domain adptation yet)
+FD001: 
+Linear Regression RMSE: 14.51
+NASA Score: 383.47
+FD002:
+Linear Regression RMSE: 30.53
+NASA Score: 14843.67
+FD003:
+Linear Regression RMSE: 18.32
+NASA Score: 823.13
+FD004:
+Linear Regression RMSE: 34.73
+NASA Score: 18760.94
+
+Domain Adaptive added:
+DAT FD001→FD002:
+RMSE: 67.76
+NASA Score: 7874334.39
+
