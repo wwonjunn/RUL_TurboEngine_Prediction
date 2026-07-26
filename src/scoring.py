@@ -17,4 +17,4 @@ def score(computed, actual):
             total_score += np.exp(error / 10) - 1
 
     print(f"NASA Score: {total_score:.2f}")
-    return rmse, total_score  # ← this line was missing
+    return rmse, total_score 

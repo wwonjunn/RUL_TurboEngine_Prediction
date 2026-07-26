@@ -27,3 +27,9 @@ NASA Score: 823.13
 FD004:
 Linear Regression RMSE: 34.73
 NASA Score: 18760.94
+
+Domain Adaptive added:
+DAT FD001→FD002:
+RMSE: 67.76
+NASA Score: 7874334.39
+
